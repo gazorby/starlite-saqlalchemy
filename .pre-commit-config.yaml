@@ -18,7 +18,10 @@ repos:
     rev: v3.2.2
     hooks:
       - id: pyupgrade
-        args: ["--py310-plus"]
+        args: ["--keep-runtime-typing", "--py310-plus"]
+        # --keep-runtime-typing does not seems to work correctly
+        # See https://github.com/asottile/pyupgrade/issues/622
+        exclude: ^src/starlite_saqlalchemy/dto.py$
   - repo: https://github.com/pycqa/isort
     rev: 5.10.1
     hooks:

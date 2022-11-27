@@ -10,14 +10,20 @@ from __future__ import annotations
 
 from enum import Enum, auto
 from inspect import getmodule, isclass
+from types import ModuleType
 from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    ForwardRef,
     Generic,
+    List,
     NamedTuple,
+    Optional,
+    TypeAlias,
     TypedDict,
     TypeVar,
+    Union,
     cast,
     get_args,
     get_origin,
@@ -27,7 +33,7 @@ from typing import (
 from pydantic import BaseModel, create_model, validator
 from pydantic.fields import FieldInfo
 from sqlalchemy import inspect
-from sqlalchemy.orm import DeclarativeBase, Mapped
+from sqlalchemy.orm import DeclarativeBase, Mapped, RelationshipProperty
 
 from starlite_saqlalchemy import settings
 
@@ -36,12 +42,16 @@ if TYPE_CHECKING:
 
     from pydantic.typing import AnyClassMethod
     from sqlalchemy import Column
-    from sqlalchemy.orm import Mapper, RelationshipProperty
+    from sqlalchemy.orm import Mapper
     from sqlalchemy.sql.base import ReadOnlyColumnCollection
     from sqlalchemy.util import ReadOnlyProperties
 
+from types import UnionType
 
 AnyDeclarative = TypeVar("AnyDeclarative", bound=DeclarativeBase)
+
+_GENERATED_DTO_MODELS: dict[str, type[_MapperBind]] = {}
+_NAMESPACE_MODULES: set[ModuleType] = set()
 
 
 class Mark(str, Enum):
@@ -136,6 +146,10 @@ def _construct_field_info(elem: Column | RelationshipProperty, purpose: Purpose)
     if default is None:
         if nullable:
             return FieldInfo(default=None)
+        if isinstance(elem, RelationshipProperty):
+            if elem.uselist:
+                return FieldInfo(default_factory=list)
+            return FieldInfo(default=None)
         return FieldInfo(...)
     if default.is_scalar:
         return FieldInfo(default=default.arg)
@@ -169,9 +183,109 @@ def _inspect_model(
     return columns, relationships
 
 
+def _build_union(union_types: tuple[Any, ...]) -> Any | Any:
+    """Build an Union type out of a type params.
+
+    Python < 3.11 don't allow the `typing.Union[*params]` syntax
+    so we build the union iteratively by pairs, using the following property :
+    Union[a, b, c] = Union[Union[a, b], c]
+    """
+    if len(union_types) < 2:
+        raise ValueError("At least two inner types are needed to build a Union")
+
+    union: Any | Any = None
+    for typ_a, typ_b in zip(union_types, union_types[1:]):
+        union = Union[typ_a, typ_b] if union is None else Union[union, Union[typ_a, typ_b]]
+    return union
+
+
+def _is_model_ref(type_: Any) -> bool:
+    return (isclass(type_) and issubclass(type_, DeclarativeBase)) or isinstance(type_, ForwardRef)
+
+
+def _type_to_name(type_: type[DeclarativeBase] | ForwardRef) -> str:
+    if isclass(type_) and issubclass(type_, DeclarativeBase):
+        return type_.__name__
+    if isinstance(type_, ForwardRef):
+        return type_.__forward_arg__
+    raise TypeError(f"can't resolve name of type {type_}")
+
+
+def _resolve_type(
+    name: str,
+    type_: TypeAlias[Any] | ForwardRef,
+    parents: dict[type[AnyDeclarative], str],
+    purpose: Purpose,
+) -> Any:
+    type_args = get_args(type_)
+    type_origin = get_origin(type_)
+
+    if isclass(type_) and _is_model_ref(type_):
+        if type_ in parents:
+            type_ = ForwardRef(parents[type_])
+        else:
+            model_name = _type_to_name(type_)
+            type_name = f"{name}_{model_name}"
+            return factory(
+                type_name,
+                type_,
+                purpose=purpose,
+                model_name=model_name,
+                parents=parents,
+            )
+    # list[model], List[mode] or Optional[model]
+    if type_origin in (list, List, Optional) and _is_model_ref(type_args[0]):
+        if type_args[0] in parents:
+            type_ = ForwardRef(parents[type_args[0]])
+        else:
+            model_name = _type_to_name(type_args[0])
+            type_name = f"{name}_{model_name}"
+            type_ = factory(
+                type_name,
+                type_args[0],
+                purpose=purpose,
+                model_name=model_name,
+                parents=parents,
+            )
+        if type_origin is Optional:
+            return Optional[type_]
+        return list[type_]  # type: ignore[valid-type]
+    # model | None or  Union[model, None]
+    # When using the new | optional syntax
+    # field is typed as types.UnionType (instead of typing.Union)
+    if type_origin in (Union, UnionType):
+        models_in_union, others_in_union = [], []
+        for arg in type_args:
+            if not _is_model_ref(arg):
+                others_in_union.append(arg)
+                continue
+            arg_model: ForwardRef | type[_MapperBind]
+            if arg in parents:
+                arg_model = ForwardRef(parents[arg])
+            else:
+                model_name = _type_to_name(arg)
+                type_name = f"{name}_{model_name}"
+                arg_model = factory(
+                    type_name,
+                    arg,
+                    purpose=purpose,
+                    model_name=model_name,
+                    parents=parents,
+                )
+            models_in_union.append(arg_model)
+
+        return _build_union((*models_in_union, *others_in_union))
+    return type_
+
+
 def _get_localns(model: type[DeclarativeBase]) -> dict[str, Any]:
+    localns: dict[str, Any] = {}
     model_module = getmodule(model)
-    return vars(model_module) if model_module is not None else {}
+    if model_module is not None:
+        _NAMESPACE_MODULES.add(model_module)
+    for module in _NAMESPACE_MODULES:
+        localns.update(vars(module))
+    return localns
 
 
 def mark(mark_type: Mark) -> DTOInfo:
@@ -207,6 +321,8 @@ def factory(
     *,
     exclude: set[str] | None = None,
     base: type[BaseModel] | None = None,
+    model_name: str | None = None,
+    parents: dict[type[AnyDeclarative], str] | None = None,
 ) -> type[_MapperBind[AnyDeclarative]]:
     """Infer a Pydantic model from a SQLAlchemy model.
 
@@ -237,6 +353,13 @@ def factory(
         A Pydantic model that includes only fields that are appropriate to `purpose` and not in
         `exclude`.
     """
+    model_name = model_name or name
+    if model_name in _GENERATED_DTO_MODELS:
+        return _GENERATED_DTO_MODELS[model_name]
+    if parents is None:
+        parents = {}
+    parents[model] = name
+
     exclude = set() if exclude is None else exclude
 
     columns, relationships = _inspect_model(model)
@@ -270,8 +393,7 @@ def factory(
         for i, func in enumerate(attrib.validators or []):
             validators[f"_validates_{key}_{i}"] = validator(key, allow_reuse=True)(func)
 
-        if isclass(type_hint) and issubclass(type_hint, DeclarativeBase):
-            type_hint = factory(f"{name}_{type_hint.__name__}", type_hint, purpose=purpose)
+        type_hint = _resolve_type(name, type_hint, parents, purpose)
 
         fields[key] = (type_hint, _construct_field_info(elem, purpose))
 
