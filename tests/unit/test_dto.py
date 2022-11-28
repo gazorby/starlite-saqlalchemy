@@ -6,8 +6,14 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, constr, validator
-from sqlalchemy import func
-from sqlalchemy.orm import DeclarativeBase, Mapped, MappedAsDataclass, mapped_column
+from sqlalchemy import ForeignKey, func
+from sqlalchemy.orm import (
+    DeclarativeBase,
+    Mapped,
+    MappedAsDataclass,
+    mapped_column,
+    relationship,
+)
 
 from starlite_saqlalchemy import dto, settings
 from tests.utils.domain.authors import Author, CreateDTO
@@ -62,6 +68,8 @@ def fx_base() -> type[DeclarativeBase]:
     class Base(DeclarativeBase):
         id: Mapped[int] = mapped_column(primary_key=True)
 
+    dto.pydantic_mapper.clear_registries()
+    dto.pydantic_mapper.add_registry(Base.registry)
     return Base
 
 
@@ -253,3 +261,25 @@ def test_from_dto() -> None:
     author = data.to_mapped()
     assert author.name == "someone"
     assert author.dob == date(1982, 3, 22)
+
+
+def test_dto_references_cycles(base: type[DeclarativeBase]) -> None:
+    class Parent(base):
+        __tablename__ = "parent"
+
+        name: Mapped[str]
+        children: Mapped[list["Child"] | None] = relationship("Child", back_populates="parent")
+
+    class Child(base):
+        __tablename__ = "child"
+
+        name: Mapped[str]
+        parent_id: Mapped[int] = mapped_column(ForeignKey("parent.id"))
+        parent: Mapped["Parent"] = relationship("Parent", back_populates="children")
+
+    dto_model_parent = dto.factory("ParentCreate", Parent, purpose=dto.Purpose.WRITE)
+    dto_model_child = dto.factory("ChildCreate", Child, purpose=dto.Purpose.WRITE)
+
+    dto_model_child.update_forward_refs()
+    parent = dto_model_parent(id=1, name="daddy")
+    child = dto_model_child(id=1, name="bobby", parent_id=1, parent=parent)

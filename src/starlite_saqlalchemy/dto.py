@@ -8,6 +8,7 @@ should always be private, or read-only at the model declaration layer.
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from enum import Enum, auto
 from inspect import getmodule, isclass
 from types import ModuleType
@@ -42,7 +43,7 @@ if TYPE_CHECKING:
 
     from pydantic.typing import AnyClassMethod
     from sqlalchemy import Column
-    from sqlalchemy.orm import Mapper
+    from sqlalchemy.orm import Mapper, registry
     from sqlalchemy.sql.base import ReadOnlyColumnCollection
     from sqlalchemy.util import ReadOnlyProperties
 
@@ -50,8 +51,275 @@ from types import UnionType
 
 AnyDeclarative = TypeVar("AnyDeclarative", bound=DeclarativeBase)
 
-_GENERATED_DTO_MODELS: dict[str, type[_MapperBind]] = {}
-_NAMESPACE_MODULES: set[ModuleType] = set()
+
+class DTOMapper:
+    def __init__(self, registry: registry | None = None) -> None:
+        self._mapped_classes: dict[str, type[DeclarativeBase]] = None
+        self._registries: list[registry] = []
+        if registry:
+            self._registries.append(registry)
+        self._model_modules: set[ModuleType] = set()
+
+    @property
+    def mapped_classes(self) -> dict[str, type[DeclarativeBase]]:
+        if self._registries is None:
+            from starlite_saqlalchemy.db.orm import Base
+
+            self.add_registry(Base.registry)
+        if self._mapped_classes is None:
+            self._mapped_classes = {}
+            for registry in self._registries:
+                self._mapped_classes.update(
+                    {m.class_.__name__: m.class_ for m in list(registry.mappers)}
+                )
+        return self._mapped_classes
+
+    def clear_registries(self) -> None:
+        self._registries = []
+        self._mapped_classes = None
+
+    def add_registry(self, registry: registry) -> None:
+        self._registries.append(registry)
+
+    def inspect_model(
+        self, model: type[DeclarativeBase]
+    ) -> tuple[ReadOnlyColumnCollection[str, Column], ReadOnlyProperties[RelationshipProperty]]:
+        mapper = cast("Mapper", inspect(model))
+        columns = mapper.columns
+        relationships = mapper.relationships
+        return columns, relationships
+
+    def get_localns(self, model: type[DeclarativeBase]) -> dict[str, Any]:
+        localns: dict[str, Any] = self.mapped_classes
+        model_module = getmodule(model)
+        if model_module is not None:
+            self._model_modules.add(model_module)
+        for module in self._model_modules:
+            localns.update(vars(module))
+        return localns
+
+    def should_exclude_field(
+        self,
+        purpose: Purpose,
+        elem: Column | RelationshipProperty,
+        exclude: set[str],
+        dto_attrib: Attrib,
+    ) -> bool:
+        if elem.key in exclude:
+            return True
+        if dto_attrib.mark is Mark.SKIP:
+            return True
+        if purpose is Purpose.WRITE and dto_attrib.mark is Mark.READ_ONLY:
+            return True
+        return False
+
+    def construct_field_info(
+        self, elem: Column | RelationshipProperty, purpose: Purpose
+    ) -> FieldInfo:
+        default = getattr(elem, "default", None)
+        nullable = getattr(elem, "nullable", False)
+        if purpose is Purpose.READ:
+            return FieldInfo(...)
+        if default is None:
+            if nullable:
+                return FieldInfo(default=None)
+            if isinstance(elem, RelationshipProperty):
+                if elem.uselist:
+                    return FieldInfo(default_factory=list)
+                return FieldInfo(default=None)
+            return FieldInfo(...)
+        if default.is_scalar:
+            return FieldInfo(default=default.arg)
+        if default.is_callable:
+            return FieldInfo(default_factory=lambda: default.arg({}))
+        raise ValueError("Unexpected default type")
+
+
+class PydanticMapper(DTOMapper):
+    supported_container_types = (List, list, Optional, Union, UnionType)
+
+    def __init__(self, registry: registry | None = None) -> None:
+        super().__init__(registry)
+        self.dtos: dict[str, type[_MapperBind]] = {}
+        self.dto_childs: dict[str, list[type[_MapperBind]]] = defaultdict(list)
+
+    def _split_type(self, type_: type) -> tuple[list[type], dict[int, list[type]]]:
+        outer_types, inner_types = [], []
+        type_args = get_args(type_)
+        type_origin = get_origin(type_)
+        if type_origin is not None:
+            outer_types.append(type_origin)
+        elif not type_args:
+            inner_types.append(type_)
+        for arg in type_args:
+            arg_outer_types, arg_inner_types = self._split_type(arg)
+            outer_types.extend(arg_outer_types)
+            inner_types.extend(arg_inner_types)
+        return outer_types, inner_types
+
+    def _build_union(self, union_types: tuple[Any, ...]) -> Any | Any:
+        """Build an Union type out of a type params.
+
+        Python < 3.11 don't allow the `typing.Union[*params]` syntax
+        so we build the union iteratively by pairs, using the following property :
+        Union[a, b, c] = Union[Union[a, b], c]
+        """
+        if len(union_types) < 2:
+            raise ValueError("At least two inner types are needed to build a Union")
+
+        union: Any | Any = None
+        for typ_a, typ_b in zip(union_types, union_types[1:]):
+            union = Union[typ_a, typ_b] if union is None else Union[union, Union[typ_a, typ_b]]
+        return union
+
+    def _rebuild_type(self, outer_types: list[type], inner_types: list[type]) -> type:
+        inner_types_ = inner_types
+        if outer_types[-1] in (Union, UnionType):
+            type_ = self._build_union(inner_types_)
+        elif len(inner_types_) >= 1:
+            type_ = outer_types[-1][inner_types_[0]]
+        else:
+            raise TypeError
+        for outer_type in outer_types[-2::-1]:
+            if outer_type not in self.supported_container_types:
+                raise TypeError
+            if outer_type in (Union, UnionType):
+                if inner_types_ is None:
+                    raise TypeError
+                else:
+                    type_ = self._build_union((type_, *inner_types_[1:]))
+                    inner_types_ = None
+            else:
+                type_ = outer_type[type_]
+        return type_
+
+    def _is_model_ref(self, type_: Any) -> bool:
+        return (isclass(type_) and issubclass(type_, DeclarativeBase)) or isinstance(
+            type_, (ForwardRef, str)
+        )
+
+    def _ref_to_model(
+        self, ref: type[DeclarativeBase] | ForwardRef | str
+    ) -> type[DeclarativeBase] | None:
+        if isinstance(ref, ForwardRef):
+            return self.mapped_classes[ref.__forward_arg__]
+        if isinstance(ref, str):
+            return self.mapped_classes[ref]
+        if isclass(ref) and issubclass(ref, DeclarativeBase):
+            return ref
+        return None
+
+    def _resolve_type(
+        self,
+        name: str,
+        type_: TypeAlias[Any] | ForwardRef,
+        parents: dict[type[AnyDeclarative], str],
+        purpose: Purpose,
+        root: str,
+        forward_refs: dict[type[AnyDeclarative], list[str]],
+    ):
+        outer_types, inner_types = self._split_type(type_)
+        resolved_inner_types = []
+        for inner_type in inner_types:
+            model = self._ref_to_model(inner_type)
+            if model is not None:
+                dto_name = f"{name}_{model.__name__}"
+                if model in parents:
+                    dto = ForwardRef(dto_name)
+                    forward_refs[model].append(dto_name)
+                else:
+                    dto = factory(
+                        dto_name,
+                        model,
+                        purpose=purpose,
+                        parents=parents,
+                        root=root,
+                        forward_refs=forward_refs,
+                    )
+                    self.dto_childs[root].append(dto)
+                resolved_inner_types.append(dto)
+            else:
+                resolved_inner_types.append(inner_type)
+        if outer_types and resolved_inner_types:
+            return self._rebuild_type(outer_types, resolved_inner_types)
+        elif len(resolved_inner_types) == 1:
+            return resolved_inner_types[0]
+        else:
+            ValueError("fuck")
+
+    def factory(
+        self,
+        name: str,
+        model: type[AnyDeclarative],
+        purpose: Purpose,
+        *,
+        exclude: set[str] | None = None,
+        base: type[BaseModel] | None = None,
+        parents: dict[type[AnyDeclarative], str] | None = None,
+        forward_refs: dict[type[AnyDeclarative], list[str]] = None,
+        root: str | None = None,
+    ) -> type[_MapperBind[AnyDeclarative]]:
+
+        if parents is None:
+            parents = {}
+        if root is None:
+            root = name
+        if forward_refs is None:
+            forward_refs = defaultdict(list)
+        parents[model] = name
+
+        exclude = set() if exclude is None else exclude
+
+        columns, relationships = self.inspect_model(model)
+        fields: dict[str, tuple[Any, FieldInfo]] = {}
+        validators: dict[str, AnyClassMethod] = {}
+        for key, type_hint in get_type_hints(model, localns=self.get_localns(model)).items():
+            # don't override fields that already exist on `base`.
+            if base is not None and key in base.__fields__:
+                continue
+
+            if get_origin(type_hint) is Mapped:
+                (type_hint,) = get_args(type_hint)
+
+            elem: Column | RelationshipProperty
+            if key in columns:
+                elem = columns[key]
+            elif key in relationships:
+                elem = relationships[key]
+            else:
+                # class var, anything else??
+                continue
+
+            attrib = _get_dto_attrib(elem)
+
+            if self.should_exclude_field(purpose, elem, exclude, attrib):
+                continue
+
+            if attrib.pydantic_type is not None:
+                type_hint = attrib.pydantic_type
+
+            for i, func in enumerate(attrib.validators or []):
+                validators[f"_validates_{key}_{i}"] = validator(key, allow_reuse=True)(func)
+
+            type_hint = self._resolve_type(name, type_hint, parents, purpose, root, forward_refs)
+
+            fields[key] = (type_hint, self.construct_field_info(elem, purpose))
+
+        dto = create_model(  # type:ignore[no-any-return,call-overload]
+            name,
+            __base__=tuple(filter(None, (base, _MapperBind[AnyDeclarative]))),
+            __cls_kwargs__={"model": model},
+            __module__=getattr(model, "__module__", __name__),
+            __validators__=validators,
+            **fields,
+        )
+        self.dtos[name] = dto
+
+        if model_forward_refs := forward_refs.get(model, None):
+            for forward_ref in model_forward_refs:
+                self.dtos[forward_ref] = dto
+
+        return dto
 
 
 class Mark(str, Enum):
@@ -137,155 +405,18 @@ class _MapperBind(BaseModel, Generic[AnyDeclarative]):
             as_model[field.name] = value
         return cast("AnyDeclarative", self.__sqla_model__(**as_model))
 
-
-def _construct_field_info(elem: Column | RelationshipProperty, purpose: Purpose) -> FieldInfo:
-    default = getattr(elem, "default", None)
-    nullable = getattr(elem, "nullable", False)
-    if purpose is Purpose.READ:
-        return FieldInfo(...)
-    if default is None:
-        if nullable:
-            return FieldInfo(default=None)
-        if isinstance(elem, RelationshipProperty):
-            if elem.uselist:
-                return FieldInfo(default_factory=list)
-            return FieldInfo(default=None)
-        return FieldInfo(...)
-    if default.is_scalar:
-        return FieldInfo(default=default.arg)
-    if default.is_callable:
-        return FieldInfo(default_factory=lambda: default.arg({}))
-    raise ValueError("Unexpected default type")
+    @classmethod
+    def update_forward_refs(cls, **localns: Any) -> None:
+        namespace = {**pydantic_mapper.dtos, **localns}
+        if childs := pydantic_mapper.dto_childs.get(cls.__name__):
+            for child in childs:
+                child.update_forward_refs(**namespace)
+        else:
+            return super().update_forward_refs(**namespace)
 
 
 def _get_dto_attrib(elem: Column | RelationshipProperty) -> Attrib:
     return elem.info.get(settings.api.DTO_INFO_KEY, Attrib())
-
-
-def _should_exclude_field(
-    purpose: Purpose, elem: Column | RelationshipProperty, exclude: set[str], dto_attrib: Attrib
-) -> bool:
-    if elem.key in exclude:
-        return True
-    if dto_attrib.mark is Mark.SKIP:
-        return True
-    if purpose is Purpose.WRITE and dto_attrib.mark is Mark.READ_ONLY:
-        return True
-    return False
-
-
-def _inspect_model(
-    model: type[DeclarativeBase],
-) -> tuple[ReadOnlyColumnCollection[str, Column], ReadOnlyProperties[RelationshipProperty]]:
-    mapper = cast("Mapper", inspect(model))
-    columns = mapper.columns
-    relationships = mapper.relationships
-    return columns, relationships
-
-
-def _build_union(union_types: tuple[Any, ...]) -> Any | Any:
-    """Build an Union type out of a type params.
-
-    Python < 3.11 don't allow the `typing.Union[*params]` syntax
-    so we build the union iteratively by pairs, using the following property :
-    Union[a, b, c] = Union[Union[a, b], c]
-    """
-    if len(union_types) < 2:
-        raise ValueError("At least two inner types are needed to build a Union")
-
-    union: Any | Any = None
-    for typ_a, typ_b in zip(union_types, union_types[1:]):
-        union = Union[typ_a, typ_b] if union is None else Union[union, Union[typ_a, typ_b]]
-    return union
-
-
-def _is_model_ref(type_: Any) -> bool:
-    return (isclass(type_) and issubclass(type_, DeclarativeBase)) or isinstance(type_, ForwardRef)
-
-
-def _type_to_name(type_: type[DeclarativeBase] | ForwardRef) -> str:
-    if isclass(type_) and issubclass(type_, DeclarativeBase):
-        return type_.__name__
-    if isinstance(type_, ForwardRef):
-        return type_.__forward_arg__
-    raise TypeError(f"can't resolve name of type {type_}")
-
-
-def _resolve_type(
-    name: str,
-    type_: TypeAlias[Any] | ForwardRef,
-    parents: dict[type[AnyDeclarative], str],
-    purpose: Purpose,
-) -> Any:
-    type_args = get_args(type_)
-    type_origin = get_origin(type_)
-
-    if isclass(type_) and _is_model_ref(type_):
-        if type_ in parents:
-            type_ = ForwardRef(parents[type_])
-        else:
-            model_name = _type_to_name(type_)
-            type_name = f"{name}_{model_name}"
-            return factory(
-                type_name,
-                type_,
-                purpose=purpose,
-                model_name=model_name,
-                parents=parents,
-            )
-    # list[model], List[mode] or Optional[model]
-    if type_origin in (list, List, Optional) and _is_model_ref(type_args[0]):
-        if type_args[0] in parents:
-            type_ = ForwardRef(parents[type_args[0]])
-        else:
-            model_name = _type_to_name(type_args[0])
-            type_name = f"{name}_{model_name}"
-            type_ = factory(
-                type_name,
-                type_args[0],
-                purpose=purpose,
-                model_name=model_name,
-                parents=parents,
-            )
-        if type_origin is Optional:
-            return Optional[type_]
-        return list[type_]  # type: ignore[valid-type]
-    # model | None or  Union[model, None]
-    # When using the new | optional syntax
-    # field is typed as types.UnionType (instead of typing.Union)
-    if type_origin in (Union, UnionType):
-        models_in_union, others_in_union = [], []
-        for arg in type_args:
-            if not _is_model_ref(arg):
-                others_in_union.append(arg)
-                continue
-            arg_model: ForwardRef | type[_MapperBind]
-            if arg in parents:
-                arg_model = ForwardRef(parents[arg])
-            else:
-                model_name = _type_to_name(arg)
-                type_name = f"{name}_{model_name}"
-                arg_model = factory(
-                    type_name,
-                    arg,
-                    purpose=purpose,
-                    model_name=model_name,
-                    parents=parents,
-                )
-            models_in_union.append(arg_model)
-
-        return _build_union((*models_in_union, *others_in_union))
-    return type_
-
-
-def _get_localns(model: type[DeclarativeBase]) -> dict[str, Any]:
-    localns: dict[str, Any] = {}
-    model_module = getmodule(model)
-    if model_module is not None:
-        _NAMESPACE_MODULES.add(model_module)
-    for module in _NAMESPACE_MODULES:
-        localns.update(vars(module))
-    return localns
 
 
 def mark(mark_type: Mark) -> DTOInfo:
@@ -314,97 +445,8 @@ def mark(mark_type: Mark) -> DTOInfo:
     return {"dto": Attrib(mark=mark_type)}
 
 
-def factory(
-    name: str,
-    model: type[AnyDeclarative],
-    purpose: Purpose,
-    *,
-    exclude: set[str] | None = None,
-    base: type[BaseModel] | None = None,
-    model_name: str | None = None,
-    parents: dict[type[AnyDeclarative], str] | None = None,
-) -> type[_MapperBind[AnyDeclarative]]:
-    """Infer a Pydantic model from a SQLAlchemy model.
-
-    The fields that are included in the model can be controlled on the SQLAlchemy class
-    definition by including a "dto" key in the `Column.info` mapping. For example:
-
-    ```python
-    class User(DeclarativeBase):
-        id: Mapped[UUID] = mapped_column(
-            default=uuid4, primary_key=True, info={"dto": Attrib(mark=dto.Mark.READ_ONLY)}
-        )
-        email: Mapped[str]
-        password_hash: Mapped[str] = mapped_column(info={"dto": Attrib(mark=dto.Mark.SKIP)})
-    ```
-
-    In the above example, a DTO generated for `Purpose.READ` will include the `id` and `email`
-    fields, while a model generated for `Purpose.WRITE` will only include a field for `email`.
-    Notice that columns marked as `Mark.SKIP` will not have a field produced in any DTO object.
-
-    Args:
-        name: Name given to the DTO class.
-        model: The SQLAlchemy model class.
-        purpose: Is the DTO for write or read operations?
-        exclude: Explicitly exclude attributes from the DTO.
-        base: A subclass of `pydantic.BaseModel` to be used as the base class of the DTO.
-
-    Returns:
-        A Pydantic model that includes only fields that are appropriate to `purpose` and not in
-        `exclude`.
-    """
-    model_name = model_name or name
-    if model_name in _GENERATED_DTO_MODELS:
-        return _GENERATED_DTO_MODELS[model_name]
-    if parents is None:
-        parents = {}
-    parents[model] = name
-
-    exclude = set() if exclude is None else exclude
-
-    columns, relationships = _inspect_model(model)
-    fields: dict[str, tuple[Any, FieldInfo]] = {}
-    validators: dict[str, AnyClassMethod] = {}
-    for key, type_hint in get_type_hints(model, localns=_get_localns(model)).items():
-        # don't override fields that already exist on `base`.
-        if base is not None and key in base.__fields__:
-            continue
-
-        if get_origin(type_hint) is Mapped:
-            (type_hint,) = get_args(type_hint)
-
-        elem: Column | RelationshipProperty
-        if key in columns:
-            elem = columns[key]
-        elif key in relationships:
-            elem = relationships[key]
-        else:
-            # class var, anything else??
-            continue
-
-        attrib = _get_dto_attrib(elem)
-
-        if _should_exclude_field(purpose, elem, exclude, attrib):
-            continue
-
-        if attrib.pydantic_type is not None:
-            type_hint = attrib.pydantic_type
-
-        for i, func in enumerate(attrib.validators or []):
-            validators[f"_validates_{key}_{i}"] = validator(key, allow_reuse=True)(func)
-
-        type_hint = _resolve_type(name, type_hint, parents, purpose)
-
-        fields[key] = (type_hint, _construct_field_info(elem, purpose))
-
-    return create_model(  # type:ignore[no-any-return,call-overload]
-        name,
-        __base__=tuple(filter(None, (base, _MapperBind[AnyDeclarative]))),
-        __cls_kwargs__={"model": model},
-        __module__=getattr(model, "__module__", __name__),
-        __validators__=validators,
-        **fields,
-    )
+pydantic_mapper = PydanticMapper()
+factory = pydantic_mapper.factory
 
 
 def decorator(
@@ -414,7 +456,7 @@ def decorator(
 
     def wrapper(cls: type[BaseModel]) -> type[_MapperBind[AnyDeclarative]]:
         def wrapped() -> type[_MapperBind[AnyDeclarative]]:
-            return factory(cls.__name__, model, purpose, exclude=exclude, base=cls)
+            return pydantic_mapper.factory(cls.__name__, model, purpose, exclude=exclude, base=cls)
 
         return wrapped()
 
