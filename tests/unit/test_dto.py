@@ -68,6 +68,8 @@ def fx_base() -> type[DeclarativeBase]:
     class Base(DeclarativeBase):
         id: Mapped[int] = mapped_column(primary_key=True)
 
+    dto.from_mapped.pydantic_dto_factory.clear_registries()
+    dto.from_mapped.pydantic_dto_factory.add_registry(Base.registry)
     return Base
 
 
@@ -347,3 +349,27 @@ def test_dto_mapped_union_relationship(base: type[DeclarativeBase]) -> None:
     assert field.default is None
     assert issubclass(field.type_, BaseModel)
     assert "val" in field.type_.__fields__
+
+
+def test_dto_references_cycles(base: type[DeclarativeBase]) -> None:
+    class Parent(base):
+        __tablename__ = "parent"
+
+        name: Mapped[str]
+        children: Mapped[list["Child"] | None] = relationship("Child", back_populates="parent")
+
+    class Child(base):
+        __tablename__ = "child"
+
+        name: Mapped[str]
+        parent_id: Mapped[int] = mapped_column(ForeignKey("parent.id"))
+        parent: Mapped["Parent"] = relationship("Parent", back_populates="children")
+
+    # dto_model_parent = dto.factory("ParentCreate", Parent, purpose=dto.Purpose.WRITE)
+    # dto_model_child = dto.factory("ChildCreate", Child, purpose=dto.Purpose.WRITE)
+    dto_model_parent = dto.FromMapped[Annotated[Parent, "write"]]
+    dto_model_child = dto.FromMapped[Annotated[Child, "write"]]
+
+    dto_model_child.update_forward_refs()
+    parent = dto_model_parent(id=1, name="daddy")
+    child = dto_model_child(id=1, name="bobby", parent_id=1, parent=parent)
