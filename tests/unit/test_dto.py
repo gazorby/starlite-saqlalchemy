@@ -323,9 +323,6 @@ def test_to_mapped_model_with_scalar_relationship(base: type[DeclarativeBase]) -
     DTO = dto.FromMapped[Annotated[B, "write"]]
     dto_instance = DTO.parse_obj({"id": 2, "a": {"id": 1}})
     mapped_instance = dto_instance.to_mapped()
-    import pprint
-
-    pprint.pprint(dto_instance.__annotations__)
     assert isinstance(mapped_instance.a, A)
 
 
