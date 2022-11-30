@@ -68,7 +68,7 @@ def fx_base() -> type[DeclarativeBase]:
     class Base(DeclarativeBase):
         id: Mapped[int] = mapped_column(primary_key=True)
 
-    dto.from_mapped.pydantic_dto_factory.clear_registries()
+    dto.from_mapped.pydantic_dto_factory.clear_mapped_classes()
     dto.from_mapped.pydantic_dto_factory.add_registry(Base.registry)
     return Base
 
@@ -373,11 +373,13 @@ def test_dto_mapped_union_relationship(base: type[DeclarativeBase]) -> None:
 
 
 def test_dto_references_cycle(base: type[DeclarativeBase]) -> None:
+    """Test a simple reference cycle."""
+
     class A(base):
         __tablename__ = "a"
 
         name: Mapped[str]
-        children: Mapped[list["B"] | None] = relationship("B", back_populates="a")
+        children: Mapped[list["B"] | None] = relationship("B", back_populates="a")  # noqa: F821
 
     class B(base):
         __tablename__ = "b"
@@ -397,15 +399,18 @@ def test_dto_references_cycle(base: type[DeclarativeBase]) -> None:
 
 
 def test_dto_references_inner_cycle(base: type[DeclarativeBase]) -> None:
+    """Test a reference cycle that do not start in the first SQLAlchemy
+    model."""
+
     class A(base):
         __tablename__ = "a"
         b_id: Mapped[int] = mapped_column(ForeignKey("b.id"))
-        b: Mapped["B"] = relationship("B")
+        b: Mapped["B"] = relationship("B")  # noqa: F821
 
     class B(base):
         __tablename__ = "b"
 
-        children: Mapped[list["C"]] = relationship("C", back_populates="b")
+        children: Mapped[list["C"]] = relationship("C", back_populates="b")  # noqa: F821
 
     class C(base):
         __tablename__ = "c"
