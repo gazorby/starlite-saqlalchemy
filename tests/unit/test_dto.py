@@ -1,7 +1,8 @@
 """Tests for the dto factory."""
 # pylint: disable=missing-class-docstring,invalid-name
 from datetime import date, datetime, timedelta
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar
+from types import UnionType
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, get_args, get_origin
 from uuid import UUID, uuid4
 
 import pytest
@@ -291,7 +292,7 @@ def test_to_mapped_model_with_collection_relationship(base: type[DeclarativeBase
 def test_to_mapped_model_with_collection_relationship_default(
     base: type[DeclarativeBase],
 ) -> None:
-    """Test building a DTO with collection relationship, and parsing data."""
+    """Test default value of DTO with collection relationship."""
 
     class A(base):
         __tablename__ = "a"
@@ -309,6 +310,25 @@ def test_to_mapped_model_with_collection_relationship_default(
     assert len(mapped_instance.a) == 0
 
 
+def test_to_mapped_model_with_collection_relationship_optional(
+    base: type[DeclarativeBase],
+) -> None:
+    """Test collection relationship typed as optional."""
+
+    class A(base):
+        __tablename__ = "a"
+        b_id: Mapped[int] = mapped_column(ForeignKey("b.id"))
+
+    class B(base):
+        __tablename__ = "b"
+
+        a: Mapped[list[A] | None] = relationship("A")
+
+    DTO = dto.FromMapped[Annotated[B, "write"]]
+    assert get_origin(DTO.__fields__["a"].annotation) is UnionType
+    assert type(None) in get_args(DTO.__fields__["a"].annotation)
+
+
 def test_to_mapped_model_with_scalar_relationship(base: type[DeclarativeBase]) -> None:
     """Test building DTO with Scalar relationship, and parsing data."""
 
@@ -324,6 +344,39 @@ def test_to_mapped_model_with_scalar_relationship(base: type[DeclarativeBase]) -
     dto_instance = DTO.parse_obj({"id": 2, "a": {"id": 1}})
     mapped_instance = dto_instance.to_mapped()
     assert isinstance(mapped_instance.a, A)
+
+
+def test_to_mapped_model_with_scalar_relationship_default(base: type[DeclarativeBase]) -> None:
+    """Test default value of DTO with Scalar relationship, and parsing data."""
+
+    class A(base):
+        __tablename__ = "a"
+
+    class B(base):
+        __tablename__ = "b"
+        a_id: Mapped[int] = mapped_column(ForeignKey("a.id"), info=dto.field("private"))
+        a: Mapped[A] = relationship("A")
+
+    DTO = dto.FromMapped[Annotated[B, "write"]]
+    dto_instance = DTO.parse_obj({"id": 2})
+    mapped_instance = dto_instance.to_mapped()
+    assert mapped_instance.a is None
+
+
+def test_to_mapped_model_with_scalar_relationship_optional(base: type[DeclarativeBase]) -> None:
+    """Test relationship typed as optional."""
+
+    class A(base):
+        __tablename__ = "a"
+
+    class B(base):
+        __tablename__ = "b"
+        a_id: Mapped[int] = mapped_column(ForeignKey("a.id"), info=dto.field("private"))
+        a: Mapped[A | None] = relationship("A")
+
+    DTO = dto.FromMapped[Annotated[B, "write"]]
+    assert get_origin(DTO.__fields__["a"].annotation) is UnionType
+    assert type(None) in get_args(DTO.__fields__["a"].annotation)
 
 
 def test_dto_field_pydantic_field(base: type[DeclarativeBase]) -> None:
