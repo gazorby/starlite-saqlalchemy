@@ -288,6 +288,27 @@ def test_to_mapped_model_with_collection_relationship(base: type[DeclarativeBase
     assert all(isinstance(val, A) for val in mapped_instance.a)
 
 
+def test_to_mapped_model_with_collection_relationship_default(
+    base: type[DeclarativeBase],
+) -> None:
+    """Test building a DTO with collection relationship, and parsing data."""
+
+    class A(base):
+        __tablename__ = "a"
+        b_id: Mapped[int] = mapped_column(ForeignKey("b.id"))
+
+    class B(base):
+        __tablename__ = "b"
+
+        a: Mapped[list[A]] = relationship("A")
+
+    DTO = dto.FromMapped[Annotated[B, "write"]]
+    dto_instance = DTO.parse_obj({"id": 1})
+    mapped_instance = dto_instance.to_mapped()
+    assert isinstance(mapped_instance.a, list)
+    assert len(mapped_instance.a) == 0
+
+
 def test_to_mapped_model_with_scalar_relationship(base: type[DeclarativeBase]) -> None:
     """Test building DTO with Scalar relationship, and parsing data."""
 
@@ -302,6 +323,9 @@ def test_to_mapped_model_with_scalar_relationship(base: type[DeclarativeBase]) -
     DTO = dto.FromMapped[Annotated[B, "write"]]
     dto_instance = DTO.parse_obj({"id": 2, "a": {"id": 1}})
     mapped_instance = dto_instance.to_mapped()
+    import pprint
+    pprint.pprint(dto_instance.__annotations__)
+    assert DTO.__fields__["a"].required
     assert isinstance(mapped_instance.a, A)
 
 
@@ -351,25 +375,56 @@ def test_dto_mapped_union_relationship(base: type[DeclarativeBase]) -> None:
     assert "val" in field.type_.__fields__
 
 
-def test_dto_references_cycles(base: type[DeclarativeBase]) -> None:
-    class Parent(base):
-        __tablename__ = "parent"
+def test_dto_references_cycle(base: type[DeclarativeBase]) -> None:
+    class A(base):
+        __tablename__ = "a"
 
         name: Mapped[str]
-        children: Mapped[list["Child"] | None] = relationship("Child", back_populates="parent")
+        children: Mapped[list["B"] | None] = relationship("B", back_populates="a")
 
-    class Child(base):
-        __tablename__ = "child"
+    class B(base):
+        __tablename__ = "b"
 
         name: Mapped[str]
-        parent_id: Mapped[int] = mapped_column(ForeignKey("parent.id"))
-        parent: Mapped["Parent"] = relationship("Parent", back_populates="children")
+        a_id: Mapped[int] = mapped_column(ForeignKey("a.id"))
+        a: Mapped["A"] = relationship("A", back_populates="children")
 
-    # dto_model_parent = dto.factory("ParentCreate", Parent, purpose=dto.Purpose.WRITE)
-    # dto_model_child = dto.factory("ChildCreate", Child, purpose=dto.Purpose.WRITE)
-    dto_model_parent = dto.FromMapped[Annotated[Parent, "write"]]
-    dto_model_child = dto.FromMapped[Annotated[Child, "write"]]
+    dto_model_child = dto.FromMapped[Annotated[B, "write"]]
 
-    dto_model_child.update_forward_refs()
-    parent = dto_model_parent(id=1, name="daddy")
-    child = dto_model_child(id=1, name="bobby", parent_id=1, parent=parent)
+    dto_child_instance = dto_model_child.parse_obj(
+        {"id": 1, "name": "b", "a_id": 1, "a": {"id": 1, "name": "a"}}
+    )
+    mapped_child_instance = dto_child_instance.to_mapped()
+    assert isinstance(mapped_child_instance, B)
+    assert isinstance(mapped_child_instance.a, A)
+
+
+# def test_dto_references_inner_cycle(base: type[DeclarativeBase]) -> None:
+#     class A(base):
+#         __tablename__ = "a"
+
+#         name: Mapped[str]
+#         b: Mapped["B"] = relationship("B", back_populates="parent")
+
+#     class B(base):
+#         __tablename__ = "b"
+
+#         name: Mapped[str]
+#         a_id: Mapped[int] = mapped_column(ForeignKey("a.id"))
+#         a: Mapped["A"] = relationship("A", back_populates="children")
+
+#     class C(base):
+#         __tablename__ = "c"
+
+#         name: Mapped[str]
+#         a_id: Mapped[int] = mapped_column(ForeignKey("a.id"))
+#         parent: Mapped["A"] = relationship("A", back_populates="children")
+
+#     dto_model_child = dto.FromMapped[Annotated[B, "write"]]
+
+#     dto_child_instance = dto_model_child.parse_obj(
+#         {"id": 1, "name": "b", "a_id": 1, "parent": {"id": 1, "name": "a"}}
+#     )
+#     mapped_child_instance = dto_child_instance.to_mapped()
+#     assert isinstance(mapped_child_instance, B)
+#     assert isinstance(mapped_child_instance.a, A)
