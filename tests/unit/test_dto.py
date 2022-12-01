@@ -1,8 +1,7 @@
-"""Tests for the dto factory."""
+"""Tests for the dto factory."""  # noqa: FA100
 # pylint: disable=missing-class-docstring,invalid-name
 from datetime import date, datetime, timedelta
-from types import UnionType
-from typing import TYPE_CHECKING, Annotated, Any, ClassVar, get_args, get_origin
+from typing import TYPE_CHECKING, Annotated, Any, ClassVar, Union, get_args, get_origin
 from uuid import UUID, uuid4
 
 import pytest
@@ -325,7 +324,7 @@ def test_to_mapped_model_with_collection_relationship_optional(
         a: Mapped[list[A] | None] = relationship("A")
 
     DTO = dto.FromMapped[Annotated[B, "write"]]
-    assert get_origin(DTO.__fields__["a"].annotation) is UnionType
+    assert get_origin(DTO.__fields__["a"].annotation) is Union
     assert type(None) in get_args(DTO.__fields__["a"].annotation)
 
 
@@ -375,7 +374,7 @@ def test_to_mapped_model_with_scalar_relationship_optional(base: type[Declarativ
         a: Mapped[A | None] = relationship("A")
 
     DTO = dto.FromMapped[Annotated[B, "write"]]
-    assert get_origin(DTO.__fields__["a"].annotation) is UnionType
+    assert get_origin(DTO.__fields__["a"].annotation) is Union
     assert type(None) in get_args(DTO.__fields__["a"].annotation)
 
 
