@@ -2,6 +2,14 @@
 
 <!--next-version-placeholder-->
 
+## v0.16.0 (2022-12-08)
+### Feature
+* **repo:** Abstract method `filter_collection_by_kwargs()` ([#159](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/159)) ([`15bf7a8`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/15bf7a814da21e105fc26b98a876f68fa0c998b4))
+
+## v0.15.0 (2022-12-05)
+### Feature
+* **testing:** ControllerTest utility. ([#152](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/152)) ([`4cc707b`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/4cc707bf25b4493b0477df173040f0fa4454fe1c))
+
 ## v0.14.2 (2022-12-03)
 ### Fix
 * **dto:** Fix UnionType parsing as relationship. ([`4b93d17`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/4b93d17e732849179bb1c2d014d8177a93a3dbfc))
