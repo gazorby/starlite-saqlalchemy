@@ -2,6 +2,41 @@
 
 <!--next-version-placeholder-->
 
+## v0.20.1 (2022-12-17)
+### Fix
+* Ensures PluginConfig doesn't carry forward refs downstream. ([#176](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/176)) ([`b37c262`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/b37c26204bc18eeaff67d626d5089738fae1abf7))
+
+## v0.20.0 (2022-12-17)
+### Feature
+* Enable toggling of db/cache checks in run-app script. ([#173](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/173)) ([`16b6380`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/16b63803799670bca8ef4f89a945b6c9a1bbe3b5))
+
+### Documentation
+* Update CHANGELOG.md ([`c73da31`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/c73da3188b5b6467e96d10add4bee50f9a6ef012))
+
+## v0.19.0 (2022-12-16)
+### Feature
+* Adds `service.RepositoryService` type. ([`598fc51`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/598fc519e3edc39475e6485ce65fcffeeceaebce)
+
+### Breaking
+* Adds `service.RepositoryService` type. ([`598fc51`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/598fc519e3edc39475e6485ce65fcffeeceaebce)
+
+## v0.18.0 (2022-12-14)
+### Feature
+* "local" environment ([`2a439e7`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/2a439e7b723276831deb66ea068537cddeb43619))
+
+### Fix
+* Msgspec json log rendering ([`818539d`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/818539d19cd60b54fe136ee7efd4f8f462cc7ff5))
+
+### Breaking
+* "local" environment ([`2a439e7`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/2a439e7b723276831deb66ea068537cddeb43619))
+
+## v0.17.0 (2022-12-13)
+### Feature
+* Follow starlite into msgspec. ([#165](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/165)) ([`2104626`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/2104626ff9016ba97675c0489d62f5106f1a9757))
+
+### Breaking
+* follow starlite into msgspec. ([#165](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/165)) ([`2104626`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/2104626ff9016ba97675c0489d62f5106f1a9757))
+
 ## v0.16.0 (2022-12-08)
 ### Feature
 * **repo:** Abstract method `filter_collection_by_kwargs()` ([#159](https://github.com/topsport-com-au/starlite-saqlalchemy/issues/159)) ([`15bf7a8`](https://github.com/topsport-com-au/starlite-saqlalchemy/commit/15bf7a814da21e105fc26b98a876f68fa0c998b4))
